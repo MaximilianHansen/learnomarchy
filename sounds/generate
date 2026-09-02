@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""Regenerate the game's chiptune sounds. Zero-dependency stdlib synth."""
+import math, struct, wave, os
+
+RATE = 22050
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+def square(freq, t):
+    return 1.0 if math.sin(2 * math.pi * freq * t) >= 0 else -1.0
+
+def render(name, notes, amp=0.32, decay=8.0):
+    """notes: list of (freq, seconds). Square wave, per-note exponential decay."""
+    samples = []
+    for freq, dur in notes:
+        n = int(RATE * dur)
+        for i in range(n):
+            t = i / RATE
+            env = math.exp(-decay * t / dur) if decay else 1.0
+            samples.append(amp * env * square(freq, t))
+    with wave.open(f"{name}.wav", "w") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(RATE)
+        w.writeframes(b"".join(
+            struct.pack("<h", int(max(-1, min(1, s)) * 32767)) for s in samples))
+    print(f"{name}.wav")
+
+render("tick",    [(660, 0.06)])
+render("go",      [(880, 0.05), (1320, 0.12)], decay=5)
+render("coin",    [(988, 0.05), (1319, 0.18)], decay=5)          # the mario one
+render("coin2",   [(1319, 0.05), (1760, 0.18)], decay=5)         # streak coin
+render("star",    [(1568, 0.05), (2093, 0.14)], decay=5)
+render("fanfare", [(784, 0.09), (1047, 0.09), (1319, 0.09), (1568, 0.09),
+                   (2093, 0.35)], decay=3)

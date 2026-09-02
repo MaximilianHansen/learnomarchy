@@ -1,0 +1,813 @@
+#!/usr/bin/env bash
+#
+# learnomarchy — learn to fly Omarchy.
+#
+# A high-dopamine keybind trainer that runs in your real window manager.
+# It spawns real windows, gives you missions, and times you via Hyprland's
+# IPC. No simulation, no dependencies beyond what Omarchy already ships.
+#
+# https://github.com/MaximilianHansen/learnomarchy — MIT
+
+set -u
+shopt -s extglob
+
+SELF_BIN=$(readlink -f "$0")
+SND_DIR=$(dirname "$SELF_BIN")/sounds
+SAVE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/learnomarchy
+SAVE_FILE=$SAVE_DIR/save
+VERSION=0.1.0
+REPO_URL="https://github.com/MaximilianHansen/learnomarchy"
+INSTALL_URL="https://raw.githubusercontent.com/MaximilianHansen/learnomarchy/main/install.sh"
+
+# ---------------------------------------------------------------- colors
+# ANSI 16 only: the game inherits whatever Omarchy theme the terminal wears.
+R=$'\e[0m'; B=$'\e[1m'; D=$'\e[2m'
+RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; BLU=$'\e[34m'
+MAG=$'\e[35m'; CYN=$'\e[36m'
+
+# ---------------------------------------------------------------- big font
+declare -A F=(
+  [0]="███|█ █|█ █|█ █|███" [1]=" █ |██ | █ | █ |███" [2]="███|  █|███|█  |███"
+  [3]="███|  █|███|  █|███" [4]="█ █|█ █|███|  █|  █" [5]="███|█  |███|  █|███"
+  [6]="███|█  |███|█ █|███" [7]="███|  █|  █|  █|  █" [8]="███|█ █|███|█ █|███"
+  [9]="███|█ █|███|  █|███" [.]="  |  |  |  |█ " [G]="████|█   |█ ██|█  █|████"
+  [O]="████|█  █|█  █|█  █|████" [!]="█|█|█| |█" [A]=" ██ |█  █|████|█  █|█  █"
+  [B]="███ |█  █|███ |█  █|███ " [C]=" ███|█   |█   |█   | ███" [" "]="  |  |  |  |  "
+)
+
+# ---------------------------------------------------------------- target mode
+# Each target is a real terminal window showing a big colored letter.
+if [[ ${1:-} == --target ]]; then
+  name=${2:-A}
+  case $name in A) c=$RED;; B) c=$GRN;; C) c=$BLU;; *) c=$MAG;; esac
+  printf '\e]2;LO·TARGET·%s\a\e[?25l' "$name"
+  trap 'exit 0' INT TERM HUP
+  clear
+  read -r rows cols < <(stty size 2>/dev/null || echo 24 80)
+  IFS='|' read -ra g <<<"${F[$name]}"
+  top=$(( rows/2 - 4 )); (( top < 0 )) && top=0
+  printf '%*s' "$top" '' | tr ' ' '\n'
+  for row in "${g[@]}"; do
+    pad=$(( (cols - ${#row}) / 2 )); (( pad < 0 )) && pad=0
+    printf '%*s%s%s%s%s\n' "$pad" '' "$B" "$c" "$row" "$R"
+  done
+  label="TARGET $name"
+  pad=$(( (cols - ${#label}) / 2 )); (( pad < 0 )) && pad=0
+  printf '\n%*s%s%s%s\n' "$pad" '' "$D" "$label" "$R"
+  while :; do sleep 3600; done
+fi
+
+# ---------------------------------------------------------------- cli
+usage() {
+  cat <<EOF
+learnomarchy $VERSION — learn to fly Omarchy.  $REPO_URL
+
+usage: learnomarchy [--level N]
+
+  --level N     jump straight to level N (1-9)
+  --update      reinstall the latest version
+  --uninstall   remove the game, its launcher entry and keybind
+  --reset       wipe your progress
+  --here        play in the current terminal instead of a fresh HUD window
+  --version, --help
+EOF
+}
+
+need() {
+  local missing=() t
+  for t in hyprctl jq xdg-terminal-exec; do command -v "$t" >/dev/null || missing+=("$t"); done
+  [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]] || missing+=("a running Hyprland session")
+  (( ${#missing[@]} )) || return 0
+  local msg="learnomarchy needs: ${missing[*]}. It runs on Omarchy 4 (Hyprland)."
+  if [[ -t 2 ]]; then echo "$msg" >&2; else notify-send -u critical learnomarchy "$msg" 2>/dev/null; fi
+  exit 1
+}
+
+uninstall() {
+  local dest bindings=$HOME/.config/hypr/bindings.lua
+  dest=$(dirname "$SELF_BIN")
+  rm -f "$HOME/.local/bin/learnomarchy" \
+        "${XDG_DATA_HOME:-$HOME/.local/share}/applications/learnomarchy.desktop"
+  [[ -f $bindings ]] && sed -i '/learnomarchy/d' "$bindings" && hyprctl reload >/dev/null 2>&1
+  [[ $dest == */learnomarchy ]] && rm -rf "$dest"
+  echo "✈ learnomarchy removed."
+  if [[ -f $SAVE_FILE ]]; then
+    local a
+    { printf 'delete your progress too (%s)? [y/N] ' "$SAVE_FILE" >/dev/tty && read -r a </dev/tty; } 2>/dev/null || a=n
+    [[ $a =~ ^[Yy]$ ]] && rm -rf "$SAVE_DIR" && echo "progress deleted."
+  fi
+  exit 0
+}
+
+case ${1:-} in
+  -h|--help)    usage; exit 0;;
+  -V|--version) echo "learnomarchy $VERSION"; exit 0;;
+  --update)     exec bash -c "curl -fsSL '$INSTALL_URL' | bash";;
+  --uninstall)  uninstall;;
+  --reset)      rm -rf "$SAVE_DIR"; echo "progress wiped — back to CADET."; exit 0;;
+  --level)      [[ ${2:-} =~ ^[1-9]$ ]] || { echo "--level needs 1-9" >&2; exit 2; };;
+  --here|--target|'') ;;
+  [1-9])        ;;
+  *)            usage >&2; exit 2;;
+esac
+need
+
+# ---------------------------------------------------------------- relaunch
+# Always play in a fresh window we control: float it, pin it, size it.
+# --here opts out (debugging).
+if [[ -z ${LEARNOMARCHY_HUD:-} && ${1:-} != --here ]]; then
+  LEARNOMARCHY_HUD=1 setsid -f xdg-terminal-exec "$SELF_BIN" "$@" >/dev/null 2>&1
+  exit 0
+fi
+HERE=''
+[[ ${1:-} == --here ]] && { HERE=1; shift; }
+
+# ---------------------------------------------------------------- state
+declare -A TADDR=()      # target name -> window address
+declare -A STARS=() BEST=()
+declare -A SEEN=()       # bind patterns already shown this session (digits → N)
+RECALL_HITS=0 RECALL_TRIES=0
+CJ='[]' AWJ='{}' WSID=0  # latest hyprctl snapshots
+TRACKED=''               # address captured by the last c_term_open
+ABORT='' SELF_ADDR=''
+LEVEL_NO=0 LEVEL_NAME='' PAR=0 NTASKS=0 HOME_WS=1
+COINS=0 LAST_SPLIT='' TASK_START=0 LEVEL_START=0
+MON_X=0 MON_Y=0 MON_W=0 MON_H=0
+FRAME='' COLS=80 ROWS=24
+
+snd() { [[ -f $SND_DIR/$1.wav ]] && pw-play "$SND_DIR/$1.wav" >/dev/null 2>&1 & }
+
+now_cs() { local t=${EPOCHREALTIME/./}; echo $(( t / 10000 )); }
+fmt_cs() { printf '%d.%d' $(( $1 / 100 )) $(( ($1 % 100) / 10 )); }
+
+# ---------------------------------------------------------------- hyprland
+# Omarchy 4's Hyprland takes Lua dispatch expressions; fall back to classic
+# dispatcher syntax so the game also runs on stock Hyprland.
+hd() {
+  local lua=$1; shift
+  hyprctl dispatch "$lua" >/dev/null 2>&1 && return 0
+  (( $# )) && hyprctl dispatch "$@" >/dev/null 2>&1
+}
+
+poll_state() {
+  CJ=$(hyprctl clients -j 2>/dev/null) || CJ='[]'
+  AWJ=$(hyprctl activewindow -j 2>/dev/null) || AWJ='{}'
+  WSID=$(hyprctl activeworkspace -j 2>/dev/null | jq -r '.id // 0')
+}
+
+cq() { jq -r --arg a "$1" ".[] | select(.address == \$a) | $2" <<<"$CJ"; }
+addr_of() { [[ $1 == T ]] && echo "$TRACKED" || echo "${TADDR[$1]:-}"; }
+
+term_addrs() {
+  jq -r '.[] | select(any(.tags[]?; startswith("terminal"))) | .address' <<<"$CJ"
+}
+
+read_monitor() {
+  read -r MON_X MON_Y MON_W MON_H < <(
+    hyprctl monitors -j | jq -r '.[] | select(.focused) |
+      "\(.x) \(.y) \((.width / .scale) | floor) \((.height / .scale) | floor)"')
+}
+
+special_ws() {
+  hyprctl monitors -j | jq -r '.[] | select(.focused) | .specialWorkspace.name'
+}
+
+spawn_target() {
+  local name=$1 addr='' i
+  setsid -f xdg-terminal-exec "$SELF_BIN" --target "$name" >/dev/null 2>&1
+  for i in {1..80}; do
+    CJ=$(hyprctl clients -j 2>/dev/null) || CJ='[]'
+    addr=$(jq -r --arg t "LO·TARGET·$name" \
+      '.[] | select(.title == $t) | .address' <<<"$CJ")
+    [[ -n $addr ]] && break
+    sleep 0.05
+  done
+  TADDR[$name]=$addr
+}
+
+close_win() {
+  hd "hl.dsp.window.close({ window = \"address:$1\" })" closewindow "address:$1"
+}
+
+cleanup_targets() {
+  local a
+  for a in "${TADDR[@]}"; do
+    [[ -n $a ]] && close_win "$a"
+  done
+  TADDR=()
+  # Sweep strays in case address tracking ever missed one.
+  hyprctl clients -j 2>/dev/null |
+    jq -r '.[] | select(.title | startswith("LO·TARGET")) | .address' |
+    while read -r a; do close_win "$a"; done
+}
+
+# ---------------------------------------------------------------- checks
+# Each returns 0 once the player has done the thing. c_*_prep runs first.
+c_term_open_prep() { BASE_TERMS=" $(term_addrs | tr '\n' ' ') "; }
+c_term_open() {
+  local a
+  for a in $(term_addrs); do
+    [[ $BASE_TERMS != *" $a "* ]] && { TRACKED=$a; return 0; }
+  done
+  return 1
+}
+c_ws()      { [[ $WSID == "$1" ]]; }
+c_ws_not()  { [[ $WSID != "$1" ]]; }
+c_tws()     { [[ $(cq "$(addr_of "$1")" '.workspace.id') == "$2" ]]; }
+c_silent()  { c_tws "$1" "$2" && [[ $WSID == "$3" ]]; }
+c_gone()    { ! jq -e --arg a "$(addr_of "$1")" \
+                'any(.[]; .address == $a)' <<<"$CJ" >/dev/null; }
+c_focus()   { [[ $(jq -r '.address' <<<"$AWJ") == "$(addr_of "$1")" ]]; }
+c_float()   { [[ $(cq "$(addr_of "$1")" '.floating') == "$2" ]]; }
+c_pin()     { [[ $(cq "$(addr_of "$1")" '.pinned') == "$2" ]]; }
+c_full()    { [[ $(cq "$(addr_of "$1")" '.fullscreen') != 0 ]]; }
+c_unfull()  { [[ $(cq "$(addr_of "$1")" '.fullscreen') == 0 ]]; }
+c_wide()    { [[ $(cq "$(addr_of "$1")" '.fullscreen') == 1 ]]; }
+c_scratch() { [[ $(cq "$(addr_of "$1")" '.workspace.name') == "special:scratchpad" ]]; }
+c_group()   { (( $(cq "$(addr_of "$1")" '.grouped | length') >= $2 )); }
+c_ungroup() { [[ $(cq "$(addr_of "$1")" '.grouped | length') == 0 ]]; }
+c_special()   { [[ $(special_ws) == special:* ]]; }
+c_nospecial() { [[ -z $(special_ws) ]]; }
+c_half() {
+  local a cx cy
+  a=$(addr_of "$1")
+  cx=$(cq "$a" '.at[0] + .size[0] / 2 | floor')
+  cy=$(cq "$a" '.at[1] + .size[1] / 2 | floor')
+  [[ -z $cx ]] && return 1
+  case $2 in
+    left)  (( cx < MON_X + MON_W / 2 ));;
+    right) (( cx > MON_X + MON_W / 2 ));;
+    top)   (( cy < MON_Y + MON_H / 2 ));;
+    bottom)(( cy > MON_Y + MON_H / 2 ));;
+  esac
+}
+
+# ---------------------------------------------------------------- rendering
+begin_frame() {
+  read -r ROWS COLS < <(stty size 2>/dev/null || echo 24 80)
+  FRAME='' NROWS=0
+}
+row() {
+  local s=${1:-} plain pad
+  plain=${s//$'\e'\[*([0-9;])m/}
+  pad=$(( (COLS - ${#plain}) / 2 )); (( pad < 0 )) && pad=0
+  FRAME+=$(printf '%*s' "$pad" '')"$s"$'\e[K\n'
+  (( NROWS++ ))
+}
+flush_frame() {
+  local top=$(( (ROWS - NROWS) / 2 )) vpad='' i
+  for (( i = 0; i < top; i++ )); do vpad+=$'\e[K\n'; done
+  printf '\e[H%s%s\e[J' "$vpad" "$FRAME"
+}
+
+row_lr() {
+  local l=${1:-} r=${2:-} lp rp pad
+  lp=${l//$'\e'\[*([0-9;])m/}
+  rp=${r//$'\e'\[*([0-9;])m/}
+  pad=$(( COLS - ${#lp} - ${#rp} - 6 )); (( pad < 1 )) && pad=1
+  FRAME+="   $l$(printf '%*s' "$pad" '')$r"$'\e[K\n'
+  (( NROWS++ ))
+}
+
+# "focus B · SUPER + ALT + ←" → dim prose for lowercase parts, reverse-video
+# keycaps for the chord. The keycaps are the visual anchor of the mission HUD.
+keycaps() {
+  local out='' seg k segs=() keys=()
+  IFS='¤' read -ra segs <<<"${1// · /¤}"
+  for seg in "${segs[@]}"; do
+    [[ -n $out ]] && out+="   "
+    if [[ $seg =~ ^[a-z] ]]; then
+      out+="${D}${seg}${R}"
+    else
+      IFS='¤' read -ra keys <<<"${seg// + /¤}"
+      local first=1
+      for k in "${keys[@]}"; do
+        (( first )) || out+=" ${D}+${R} "
+        first=0
+        out+=$'\e[1m\e[7m'" $k "$'\e[0m'
+      done
+    fi
+  done
+  printf '%s' "$out"
+}
+
+big() {
+  local s=$1 color=${2:-} r i ch line rows
+  for r in 0 1 2 3 4; do
+    line=''
+    for (( i = 0; i < ${#s}; i++ )); do
+      ch=${s:i:1}
+      IFS='|' read -ra rows <<<"${F[$ch]:-${F[" "]}}"
+      line+="${rows[r]:-   } "
+    done
+    row "${B}${color}${line}${R}"
+  done
+}
+
+stars_row() {
+  local n=$1 out='' i
+  for i in 1 2 3 4 5; do
+    (( i <= n )) && out+="${B}${YEL}★ ${R}" || out+="${D}☆ ${R}"
+  done
+  row "$out"
+}
+
+coins_row() {
+  local out='' i
+  for (( i = 1; i <= NTASKS; i++ )); do
+    (( i <= COINS )) && out+="${YEL}⬤ ${R}" || out+="${D}○ ${R}"
+  done
+  out+=" ${D}$COINS/$NTASKS${R}"
+  row "$out"
+}
+
+# ---------------------------------------------------------------- game loop
+do_task() {
+  [[ -n $ABORT ]] && return 1
+  local check=$1 desc=$2 hint=${3:-} fn split color key t hudfoc
+  fn=${check%% *}
+  declare -F "${fn}_prep" >/dev/null && "${fn}_prep"
+  TASK_START=$(now_cs)
+  # A bind pattern is only shown the first time; after that the player flies
+  # from memory (recall is where learning happens). Stalling reveals the hint.
+  local hkey=${hint//[0-9]/N} hidden='' hint_rendered=''
+  if [[ -n $hint && -n ${SEEN[$hkey]:-} ]]; then
+    hidden=1
+    (( RECALL_TRIES++ ))
+  fi
+  while :; do
+    poll_state
+    if $check; then
+      split=$(( $(now_cs) - TASK_START ))
+      (( COINS++ ))
+      # Only count a hint as seen if it was actually on screen for at least one
+      # frame — an instantly-completed task must not hide the bind later.
+      [[ -n $hint && -n $hint_rendered ]] && SEEN[$hkey]=1
+      if [[ -n $hidden ]]; then
+        (( RECALL_HITS++ ))
+        LAST_SPLIT="${GRN}✓${R} ${D}${desc}  $(fmt_cs "$split")s${R}  ${YEL}⚡ recalled${R}"
+        snd coin2
+      else
+        LAST_SPLIT="${GRN}✓${R} ${D}${desc}  $(fmt_cs "$split")s${R}"
+        snd coin
+      fi
+      return 0
+    fi
+    (( $(now_cs) - TASK_START > 400 )) && hidden=''
+    hudfoc=''
+    [[ $(jq -r '.address' <<<"$AWJ") == "$SELF_ADDR" ]] && hudfoc=1
+    if [[ -n $hudfoc && $fn == c_gone ]]; then
+      # The player is aiming at the HUD during a shoot-down: put their
+      # crosshair on the doomed window instead of letting them kill the game.
+      local doomed; doomed=$(addr_of "${check#* }")
+      [[ -n $doomed ]] && \
+        hd "hl.dsp.focus({ window = \"address:$doomed\" })" focuswindow "address:$doomed"
+      hudfoc=''
+    fi
+    t=$(( $(now_cs) - LEVEL_START ))
+    if   (( t <= PAR ));           then color=$D
+    elif (( t <= PAR * 3 / 2 ));   then color=$YEL
+    else color=$RED; fi
+    begin_frame
+    row ''
+    row_lr "${D}LEVEL $LEVEL_NO — $LEVEL_NAME${R}" "${color}$(fmt_cs "$t")s${R}"
+    row ''
+    coins_row
+    row ''
+    row ''
+    row "${B}${desc^^}${R}"
+    row ''
+    if [[ -n $hidden ]]; then
+      row "${D}· · ·  from memory  · · ·${R}"
+    else
+      row "$(keycaps "$hint")"
+      hint_rendered=1
+    fi
+    row ''
+    row ''
+    if [[ -n $hudfoc ]]; then
+      row "${YEL}⚠ focus is on this HUD — SUPER + ← ↑ → ↓ flies to a window${R}"
+    else
+      row "${LAST_SPLIT}"
+    fi
+    row ''
+    row "${D}[q] on this HUD aborts${R}"
+    flush_frame
+    if read -rsn1 -t 0.08 key 2>/dev/null; then
+      [[ $key == q ]] && { ABORT=1; return 1; }
+    fi
+  done
+}
+
+begin_level() {
+  LEVEL_NO=$1 LEVEL_NAME=$2 PAR=$3 NTASKS=$4
+  COINS=0 LAST_SPLIT='' ABORT='' TRACKED=''
+  RECALL_HITS=0 RECALL_TRIES=0
+  poll_state
+  HOME_WS=$WSID
+  read_monitor
+  local t
+  for t in ${5:-}; do spawn_target "$t"; done
+  countdown
+  LEVEL_START=$(now_cs)
+}
+
+countdown() {
+  begin_frame; row ''; row ''; big 'GO!' "$GRN"; FRAME_READY=$FRAME
+  begin_frame; row ''; row "${D}LEVEL $LEVEL_NO — $LEVEL_NAME${R}"; row ''
+  row "${B}READY${R}"; flush_frame
+  snd tick; sleep 0.55
+  FRAME=$FRAME_READY; flush_frame
+  snd go; sleep 0.3
+}
+
+pick_ws() {
+  local avoid=" $* " w
+  for w in 3 4 5 7 8 9 2 6; do
+    [[ $avoid != *" $w "* ]] && { echo "$w"; return; }
+  done
+}
+
+calc_stars() {
+  local t=$1
+  if   (( t <= PAR ));            then echo 5
+  elif (( t <= PAR * 15 / 10 ));  then echo 4
+  elif (( t <= PAR * 22 / 10 ));  then echo 3
+  elif (( t <= PAR * 35 / 10 ));  then echo 2
+  else echo 1; fi
+}
+
+end_level() {
+  local total stars new_best=''
+  cleanup_targets
+  if [[ -n $ABORT ]]; then ACTION=menu; return 1; fi
+  total=$(( $(now_cs) - LEVEL_START ))
+  stars=$(calc_stars "$total")
+  if [[ -z ${BEST[$LEVEL_NO]:-} ]] || (( total < BEST[$LEVEL_NO] )); then
+    BEST[$LEVEL_NO]=$total; new_best=1
+  fi
+  (( stars > ${STARS[$LEVEL_NO]:-0} )) && STARS[$LEVEL_NO]=$stars
+  save_progress
+  hd "hl.dsp.focus({ workspace = \"$HOME_WS\" })" workspace "$HOME_WS"
+  hd "hl.dsp.focus({ window = \"address:$SELF_ADDR\" })" focuswindow "address:$SELF_ADDR"
+  results_screen "$total" "$stars" "$new_best"
+}
+
+results_screen() {
+  local total=$1 stars=$2 new_best=$3 shown=0 key shared=''
+  while (( shown < stars )); do
+    (( shown++ ))
+    render_results "$total" "$shown" "$new_best" ''
+    snd star; sleep 0.22
+  done
+  (( stars == 5 )) && snd fanfare
+  while :; do
+    render_results "$total" "$stars" "$new_best" "$shared"
+    read -rsn1 key 2>/dev/null
+    case $key in
+      '') ACTION=next; return;;
+      r)  ACTION=retry; return;;
+      m)  ACTION=menu; return;;
+      q)  ACTION=quit; return;;
+      s)  share_card "$total" "$stars"; shared=1;;
+    esac
+  done
+}
+
+render_results() {
+  local total=$1 stars=$2 new_best=$3 shared=$4
+  begin_frame
+  row ''
+  row "${D}LEVEL $LEVEL_NO — $LEVEL_NAME${R}"
+  row ''
+  big "$(fmt_cs "$total")" "$CYN"
+  row ''
+  stars_row "$stars"
+  row ''
+  [[ -n $new_best ]] && row "${B}${GRN}NEW BEST${R}" || row ''
+  row "${D}★★★★★ under $(fmt_cs "$PAR")s   best $(fmt_cs "${BEST[$LEVEL_NO]}")s${R}"
+  if (( RECALL_TRIES == 0 )); then
+    row ''
+  elif (( RECALL_HITS == RECALL_TRIES )); then
+    row "${B}${YEL}⚡ 100% RECALL${R}"
+  else
+    row "${D}recall $RECALL_HITS/$RECALL_TRIES — stalls reveal the keys${R}"
+  fi
+  if [[ -n $shared ]]; then
+    row "${GRN}✓ card copied — Ctrl+V it into the post${R}"
+  else
+    row ''
+  fi
+  row "${D}[↵] next   [r] again   [s] share   [m] hangar   [q] quit${R}"
+  flush_frame
+}
+
+# ---------------------------------------------------------------- share
+share_card() {
+  local total=$1 stars=$2 out=''
+  begin_frame
+  row ''; row ''
+  row "${B}${CYN}✈  L E A R N O M A R C H Y${R}"
+  row ''
+  row "${B}LEVEL $LEVEL_NO — $LEVEL_NAME${R}"
+  row ''
+  big "$(fmt_cs "$total")" "$CYN"
+  row ''
+  stars_row "$stars"
+  if (( RECALL_TRIES > 0 && RECALL_HITS == RECALL_TRIES )); then
+    row "${B}${YEL}⚡ 100% RECALL${R}"
+  elif (( RECALL_TRIES > 0 )); then
+    row "${D}recall $RECALL_HITS/$RECALL_TRIES${R}"
+  else
+    row ''
+  fi
+  row ''
+  row "${D}can you fly omarchy?${R}"
+  flush_frame
+  sleep 0.4
+  poll_state
+  read -r gx gy gw gh < <(cq "$SELF_ADDR" '"\(.at[0]) \(.at[1]) \(.size[0]) \(.size[1])"')
+  local png=${XDG_RUNTIME_DIR:-/tmp}/learnomarchy-card.png
+  grim -g "${gx},${gy} ${gw}x${gh}" "$png" 2>/dev/null && wl-copy < "$png"
+  local star_txt='' i
+  for i in $(seq 1 "$stars"); do star_txt+='★'; done
+  local text="learning to fly @omarchy ✈
+LEVEL $LEVEL_NO — $LEVEL_NAME  $star_txt  $(fmt_cs "$total")s
+
+$REPO_URL"
+  xdg-open "https://x.com/intent/post?text=$(jq -rn --arg t "$text" '$t | @uri')" \
+    >/dev/null 2>&1 &
+  snd coin
+}
+
+# ---------------------------------------------------------------- levels
+level_1() {  # CADET
+  begin_level 1 'TAKEOFF' 1500 10
+  local w1 w2
+  w1=$(pick_ws "$HOME_WS"); w2=$(pick_ws "$HOME_WS" "$w1")
+  do_task 'c_term_open'   'Punch open a terminal'          'SUPER + ENTER'
+  do_task "c_tws T $w1"   "Throw it to workspace $w1"      "SUPER + SHIFT + $w1"
+  do_task 'c_gone T'      'Shoot it down'                  'SUPER + W'
+  do_task "c_ws $HOME_WS" 'Fly home'                       "SUPER + $HOME_WS"
+  do_task 'c_term_open'   'Again — open a terminal'        'SUPER + ENTER'
+  do_task "c_tws T $w2"   "Throw it to workspace $w2"      "SUPER + SHIFT + $w2"
+  do_task 'c_gone T'      'Shoot it down'                  'SUPER + W'
+  do_task "c_ws $HOME_WS" 'Fly home'                       "SUPER + $HOME_WS"
+  do_task 'c_term_open'   'One more terminal'              'SUPER + ENTER'
+  do_task 'c_gone T'      'Shoot it down'                  'SUPER + W'
+  end_level
+}
+
+level_2() {
+  begin_level 2 'RADAR' 1300 9 'A B C'
+  do_task 'c_focus B' 'Lock onto TARGET B' 'SUPER + ← ↑ → ↓'
+  do_task 'c_focus A' 'Lock onto TARGET A' 'SUPER + ← ↑ → ↓'
+  do_task 'c_focus C' 'Lock onto TARGET C' 'SUPER + ← ↑ → ↓'
+  do_task 'c_focus B' 'Back to B'          'SUPER + ← ↑ → ↓'
+  do_task 'c_focus A' 'Back to A'          'SUPER + ← ↑ → ↓'
+  do_task 'c_focus C' 'Back to C'          'SUPER + ← ↑ → ↓'
+  do_task 'c_gone C'  'Shoot down C'       'SUPER + W'
+  do_task 'c_gone A'  'Shoot down A'       'focus A · SUPER + W'
+  do_task 'c_gone B'  'Shoot down B'       'SUPER + W'
+  end_level
+}
+
+level_3() {
+  begin_level 3 'CARGO' 2200 11 'A B'
+  local w1 w2
+  w1=$(pick_ws "$HOME_WS"); w2=$(pick_ws "$HOME_WS" "$w1")
+  do_task 'c_focus A'     'Lock onto TARGET A'          'SUPER + ← ↑ → ↓'
+  do_task "c_tws A $w1"   "Throw A to workspace $w1"    "SUPER + SHIFT + $w1"
+  do_task "c_ws $HOME_WS" 'Fly back home'               "SUPER + $HOME_WS"
+  do_task 'c_focus B'     'Lock onto TARGET B'          'SUPER + ← ↑ → ↓'
+  do_task "c_tws B $w2"   "Throw B to workspace $w2"    "SUPER + SHIFT + $w2"
+  do_task "c_ws $HOME_WS" 'Fly back home'               "SUPER + $HOME_WS"
+  do_task "c_ws $w1"      "Fly to workspace $w1"        "SUPER + $w1"
+  do_task 'c_gone A'      'Shoot down A'                'SUPER + W'
+  do_task "c_ws $w2"      "Fly to workspace $w2"        "SUPER + $w2"
+  do_task 'c_gone B'      'Shoot down B'                'SUPER + W'
+  do_task "c_ws $HOME_WS" 'Fly home'                    "SUPER + $HOME_WS"
+  end_level
+}
+
+level_4() {  # PILOT
+  begin_level 4 'FORMATION' 1600 9 'A B C'
+  do_task 'c_focus A'       'Lock onto A'             'SUPER + ← ↑ → ↓'
+  do_task 'c_half A right'  'Sling A to the RIGHT'    'SUPER + SHIFT + →'
+  do_task 'c_half A left'   'Sling A back LEFT'       'SUPER + SHIFT + ←'
+  do_task 'c_focus C'       'Lock onto C'             'SUPER + ← ↑ → ↓'
+  do_task 'c_half C top'    'Punch C to the TOP'      'SUPER + SHIFT + ↑'
+  do_task 'c_half C bottom' 'Drop C to the BOTTOM'    'SUPER + SHIFT + ↓'
+  do_task 'c_gone A'        'Shoot down A'            'focus A · SUPER + W'
+  do_task 'c_gone B'        'Shoot down B'            'focus B · SUPER + W'
+  do_task 'c_gone C'        'Shoot down C'            'SUPER + W'
+  end_level
+}
+
+level_5() {
+  begin_level 5 'STASH' 1500 9 'A'
+  do_task 'c_float A true'  'Break A loose — float it'   'SUPER + T'
+  do_task 'c_float A false' 'Snap it back'               'SUPER + T'
+  do_task 'c_float A true'  'Float it again'             'SUPER + T'
+  do_task 'c_float A false' 'And back'                   'SUPER + T'
+  do_task 'c_scratch A'     'Stash A in the scratchpad'  'SUPER + ALT + S'
+  do_task 'c_special'       'Summon the scratchpad'      'SUPER + S'
+  do_task 'c_nospecial'     'Dismiss it'                 'SUPER + S'
+  do_task 'c_special'       'Summon it back'             'SUPER + S'
+  do_task 'c_gone A'        'Shoot A down'               'SUPER + W'
+  end_level
+}
+
+level_6() {
+  begin_level 6 'AFTERBURNER' 1700 10
+  do_task 'c_term_open'       'Punch open a terminal'       'SUPER + ENTER'
+  do_task 'c_full T'          'Take it FULL SCREEN'         'SUPER + F'
+  do_task 'c_unfull T'        'Drop it back'                'SUPER + F'
+  do_task 'c_wide T'          'Now FULL WIDTH'              'SUPER + ALT + F'
+  do_task 'c_unfull T'        'Back down'                   'SUPER + ALT + F'
+  do_task "c_ws_not $HOME_WS" 'Surf to another workspace'   'SUPER + TAB · or SUPER + 2'
+  do_task "c_ws $HOME_WS"     'Surf back home'              'SUPER + SHIFT + TAB'
+  do_task "c_ws_not $HOME_WS" 'Surf away again'             'SUPER + TAB'
+  do_task "c_ws $HOME_WS"     'And back'                    'SUPER + SHIFT + TAB'
+  do_task 'c_gone T'          'Shoot down the terminal'     'SUPER + W'
+  end_level
+}
+
+level_7() {  # ACE
+  begin_level 7 'GHOST' 1900 10 'A B C'
+  local w1 w2 w3
+  w1=$(pick_ws "$HOME_WS"); w2=$(pick_ws "$HOME_WS" "$w1")
+  w3=$(pick_ws "$HOME_WS" "$w1" "$w2")
+  do_task 'c_focus A' 'Lock onto A' 'SUPER + ← ↑ → ↓'
+  do_task "c_silent A $w1 $HOME_WS" "Ghost A to $w1 — DON'T follow" "SUPER + SHIFT + ALT + $w1"
+  do_task 'c_focus B' 'Lock onto B' 'SUPER + ← ↑ → ↓'
+  do_task "c_silent B $w2 $HOME_WS" "Ghost B to $w2"                "SUPER + SHIFT + ALT + $w2"
+  do_task 'c_focus C' 'Lock onto C' 'SUPER + ← ↑ → ↓'
+  do_task "c_silent C $w3 $HOME_WS" "Ghost C to $w3"                "SUPER + SHIFT + ALT + $w3"
+  do_task "c_ws $w1" "Fly to $w1 and fetch A"                       "SUPER + $w1"
+  do_task "c_silent A $HOME_WS $w1" 'Ghost A back home — stay put'  "SUPER + SHIFT + ALT + $HOME_WS"
+  do_task "c_ws $HOME_WS" 'Fly home to meet it'                     "SUPER + $HOME_WS"
+  do_task 'c_gone A' 'Shoot A down'                                 'SUPER + W'
+  end_level
+}
+
+level_8() {
+  begin_level 8 'SQUADRON' 1700 10 'A B'
+  do_task 'c_focus A'   'Lock onto A'                 'SUPER + ← ↑ → ↓'
+  do_task 'c_group A 1' 'Forge a group'               'SUPER + G'
+  do_task 'c_focus B'   'Lock onto B'                 'SUPER + ← ↑ → ↓'
+  do_task 'c_group A 2' 'Absorb B into the squadron'  'SUPER + ALT + ←'
+  do_task 'c_focus A'   "Flip to A's tab"             'SUPER + ALT + TAB'
+  do_task 'c_focus B'   "Flip to B's tab"             'SUPER + ALT + TAB'
+  do_task 'c_focus A'   'Flip back to A'              'SUPER + ALT + TAB'
+  do_task 'c_ungroup A' 'Eject A from the squadron'   'SUPER + ALT + G'
+  do_task 'c_gone A'    'Shoot down A'                'SUPER + W'
+  do_task 'c_gone B'    'Shoot down B'                'SUPER + W'
+  end_level
+}
+
+level_9() {
+  begin_level 9 'PSYCHOPATH' 1800 11 'A B'
+  local w; w=$(pick_ws "$HOME_WS")
+  do_task 'c_focus A' 'Lock onto A' 'SUPER + ← ↑ → ↓'
+  do_task "c_silent A $w $HOME_WS" "Ghost A to $w — DON'T follow" "SUPER + SHIFT + ALT + $w"
+  do_task 'c_pin B true' 'Pop B out — float & pin'  'focus B · SUPER + O'
+  do_task 'c_gone B'     'Shoot B down'             'SUPER + W'
+  do_task "c_ws $w"      "Dive to workspace $w"     "SUPER + $w"
+  do_task 'c_full A'     'Max A out'                'SUPER + F'
+  do_task 'c_unfull A'   'Drop it'                  'SUPER + F'
+  do_task 'c_scratch A'  'Stash A in the scratchpad' 'SUPER + ALT + S'
+  do_task "c_ws $HOME_WS" 'Fly home'                "SUPER + $HOME_WS"
+  do_task 'c_special'    'Summon the scratchpad'    'SUPER + S'
+  do_task 'c_gone A'     'Shoot A down'             'SUPER + W'
+  end_level
+}
+
+declare -a LEVEL_NAMES=('' TAKEOFF RADAR CARGO FORMATION STASH AFTERBURNER GHOST SQUADRON PSYCHOPATH)
+declare -a LEVEL_PARS=('' 1500 1300 2200 1600 1500 1700 1900 1700 1800)
+N_LEVELS=9
+
+# ---------------------------------------------------------------- progress
+load_progress() {
+  [[ -f $SAVE_FILE ]] || return 0
+  local n s b
+  while IFS='|' read -r n s b; do
+    [[ $n =~ ^[0-9]+$ ]] && { STARS[$n]=$s; BEST[$n]=$b; }
+  done < "$SAVE_FILE"
+}
+save_progress() {
+  mkdir -p "$SAVE_DIR"
+  local n
+  for n in "${!STARS[@]}"; do
+    echo "$n|${STARS[$n]}|${BEST[$n]:-0}"
+  done > "$SAVE_FILE"
+}
+unlocked() { (( $1 == 1 )) || (( ${STARS[$(( $1 - 1 ))]:-0} >= 3 )); }
+total_stars() {
+  local t=0 n
+  for n in "${!STARS[@]}"; do (( t += ${STARS[$n]} )); done
+  echo "$t"
+}
+
+# ---------------------------------------------------------------- menu
+menu_screen() {
+  local key n line tier
+  while :; do
+    begin_frame
+    row ''
+    row "${B}${CYN}✈  L E A R N O M A R C H Y${R}"
+    row "${D}learn to fly omarchy${R}"
+    row ''
+    for n in $(seq 1 "$N_LEVELS"); do
+      case $n in
+        1) row "${D}── CADET ──────────────${R}";;
+        4) row "${D}── PILOT ──────────────${R}";;
+        7) row "${D}── ACE ────────────────${R}";;
+      esac
+      if unlocked "$n"; then
+        local s=${STARS[$n]:-0} sr='' i
+        for i in 1 2 3 4 5; do
+          (( i <= s )) && sr+="${YEL}★${R}" || sr+="${D}☆${R}"
+        done
+        line=$(printf '%s%d %-12s%s %s' "$B" "$n" "${LEVEL_NAMES[$n]}" "$R" "$sr")
+        [[ -n ${BEST[$n]:-} ]] && line+="  ${D}$(fmt_cs "${BEST[$n]}")s${R}"
+        row "$line"
+      else
+        row "${D}$(printf '%d %-12s' "$n" "${LEVEL_NAMES[$n]}") 🔒 3★ level $(( n - 1 ))${R}"
+      fi
+    done
+    row ''
+    local ts; ts=$(total_stars)
+    if (( ts >= 45 )); then
+      row "${B}${YEL}★ $ts/45 — PSYCHOPATH CERTIFIED ★${R}"
+    else
+      row "${D}★ $ts/45${R}"
+    fi
+    row ''
+    row "${D}[1-9] fly   [q] quit${R}"
+    flush_frame
+    read -rsn1 key 2>/dev/null
+    case $key in
+      [1-9]) unlocked "$key" && { CHOICE=$key; return 0; };;
+      q) return 1;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------- window setup
+setup_window() {
+  [[ -n $HERE ]] && return  # debugging in an existing terminal: leave it alone
+  printf '\e]2;learnomarchy #%s\a' "$$"
+  local i
+  for i in {1..60}; do
+    SELF_ADDR=$(hyprctl clients -j 2>/dev/null | jq -r --arg t "learnomarchy #$$" \
+      '.[] | select(.title == $t) | .address')
+    [[ -n $SELF_ADDR ]] && break
+    sleep 0.05
+  done
+  [[ -z $SELF_ADDR ]] && return
+  read_monitor
+  local w=920 h=560 win="address:$SELF_ADDR"
+  local x=$(( MON_X + MON_W - w - 24 )) y=$(( MON_Y + 60 ))
+  hd "hl.dsp.window.float({ window = \"$win\", action = \"toggle\" })" setfloating "$win"
+  hd "hl.dsp.window.resize({ window = \"$win\", x = $w, y = $h })" \
+     resizewindowpixel "exact $w $h,$win"
+  hd "hl.dsp.window.move({ window = \"$win\", x = $x, y = $y })" \
+     movewindowpixel "exact $x $y,$win"
+  hd "hl.dsp.window.pin({ window = \"$win\" })" pin "$win"
+  hd "hl.dsp.window.alter_zorder({ window = \"$win\", mode = \"top\" })" alterzorder "top,$win"
+  hd "hl.dsp.focus({ window = \"$win\" })" focuswindow "$win"
+}
+
+# ---------------------------------------------------------------- main
+finish() {
+  cleanup_targets
+  printf '\e[?1049l\e[?25h'
+}
+trap finish EXIT
+trap 'exit 130' INT TERM
+
+printf '\e[?1049h\e[?25l'
+setup_window
+load_progress
+
+CHOICE=${1:-}
+[[ $CHOICE == --level ]] && CHOICE=${2:-1}
+[[ $CHOICE =~ ^[1-9]$ ]] || CHOICE=''
+
+while :; do
+  if [[ -z $CHOICE ]]; then
+    menu_screen || break
+    CHOICE=$CHOICE
+  fi
+  ACTION=menu
+  "level_$CHOICE"
+  case $ACTION in
+    retry) ;;                              # same CHOICE, go again
+    next)  if (( CHOICE < N_LEVELS )) && unlocked $(( CHOICE + 1 )); then
+             CHOICE=$(( CHOICE + 1 ))
+           else CHOICE=''; fi;;
+    menu)  CHOICE='';;
+    quit)  break;;
+  esac
+done
