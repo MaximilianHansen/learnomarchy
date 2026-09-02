@@ -33,7 +33,8 @@ done
 [[ -f $BINDINGS ]] || warn "no ~/.config/hypr/bindings.lua found — is this Omarchy 4? Installing anyway."
 
 # ---------------------------------------------------------------- fetch
-src=$(cd "$(dirname "${BASH_SOURCE[0]:-/nonexistent}")" 2>/dev/null && pwd || true)
+src=''
+[[ -n ${BASH_SOURCE[0]:-} ]] && src=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)
 if [[ -n $src && -f $src/learnomarchy && -d $src/sounds && $src != "$DEST" ]]; then
   say "installing from $src"
   rm -rf "$DEST"; mkdir -p "$DEST"
@@ -63,7 +64,7 @@ Terminal=false
 Categories=Game;Education;
 Keywords=omarchy;hyprland;keybind;keyboard;trainer;
 DESKTOP
-command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" 2>/dev/null || true
+if command -v update-desktop-database >/dev/null; then update-desktop-database "$APPS" 2>/dev/null || true; fi
 
 # ---------------------------------------------------------------- keybind
 if [[ -f $BINDINGS ]] && ! grep -q learnomarchy "$BINDINGS"; then

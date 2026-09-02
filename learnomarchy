@@ -484,7 +484,7 @@ render_results() {
   row ''
   stars_row "$stars"
   row ''
-  [[ -n $new_best ]] && row "${B}${GRN}NEW BEST${R}" || row ''
+  if [[ -n $new_best ]]; then row "${B}${GRN}NEW BEST${R}"; else row ''; fi
   row "${D}★★★★★ under $(fmt_cs "$PAR")s   best $(fmt_cs "${BEST[$LEVEL_NO]}")s${R}"
   if (( RECALL_TRIES == 0 )); then
     row ''
@@ -531,7 +531,8 @@ share_card() {
   grim -g "${gx},${gy} ${gw}x${gh}" "$png" 2>/dev/null && wl-copy < "$png"
   local star_txt='' i
   for i in $(seq 1 "$stars"); do star_txt+='★'; done
-  local text="learning to fly @omarchy ✈
+  local text
+  text="learning to fly @omarchy ✈
 LEVEL $LEVEL_NO — $LEVEL_NAME  $star_txt  $(fmt_cs "$total")s
 
 $REPO_URL"
@@ -684,7 +685,6 @@ level_9() {
 }
 
 declare -a LEVEL_NAMES=('' TAKEOFF RADAR CARGO FORMATION STASH AFTERBURNER GHOST SQUADRON PSYCHOPATH)
-declare -a LEVEL_PARS=('' 1500 1300 2200 1600 1500 1700 1900 1700 1800)
 N_LEVELS=9
 
 # ---------------------------------------------------------------- progress
@@ -711,7 +711,7 @@ total_stars() {
 
 # ---------------------------------------------------------------- menu
 menu_screen() {
-  local key n line tier
+  local key n line
   while :; do
     begin_frame
     row ''
@@ -798,7 +798,6 @@ CHOICE=${1:-}
 while :; do
   if [[ -z $CHOICE ]]; then
     menu_screen || break
-    CHOICE=$CHOICE
   fi
   ACTION=menu
   "level_$CHOICE"
